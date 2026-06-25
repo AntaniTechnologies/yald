@@ -1,6 +1,7 @@
 # YALD - Yet Another Llama Dashboard
 
 A real-time terminal UI for monitoring llama-server instances.
+One file. One command. One screen. Zero fuss.
 
 ## Prerequisites
 
