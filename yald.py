@@ -1,6 +1,6 @@
 """
 YALD - Yet Another Llama Dashboard
-v1.0
+v1.1.1
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -267,8 +267,17 @@ class MetricsCollector:
         # safeguard at the top only uses them when n_prompt==0, i.e. after
         # the prompt was consumed, so the *previous* iteration's value is what
         # matters).
+        # BUG FIX: save the *effective* n_prompt (post-fallback), not the raw
+        # slot value stored in snapshot.n_prompt_tokens (which is the pre-fallback
+        # zero).  snapshot.context_tokens holds the post-fallback value (set at
+        # line 222 from the corrected n_prompt), so mirror that here.
+        # Using snapshot.n_prompt_tokens was wrong: on the very first tick that
+        # n_prompt drops to 0 the raw value would overwrite the good previous
+        # value, making _prev_prompt_tokens==0 and causing the safeguard to
+        # fall through to _max_context (an unrelated high-water mark) on the
+        # next tick — producing the visible discontinuity in Context Usage.
         self._prev_context_tokens = snapshot.context_tokens
-        self._prev_prompt_tokens = snapshot.n_prompt_tokens
+        self._prev_prompt_tokens  = n_prompt   # n_prompt is the effective value after all fallbacks above
 
     def _apply_cached_slot_data(self, snapshot: MetricSnapshot) -> None:
         """Restore high-water / last-seen values when no active slot is found."""
