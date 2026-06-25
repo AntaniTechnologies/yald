@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-06-25
+
+### Fixed
+
+- Context Usage progress bar no longer jumps to unrelated values when llama-server goes idle; safeguard now saves the effective `n_prompt` value (after fallbacks) instead of the raw pre-fallback slot value, preventing stale 0 from being persisted as the "last known good"
+
 ## [1.1] - 2026-06-25
 
 ### Added
