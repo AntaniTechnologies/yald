@@ -25,6 +25,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 import json
+import os
 import signal
 import threading
 import time
@@ -81,6 +82,8 @@ class MetricSnapshot:
    # Reasoning (model-specific)
     reasoning_format: str = ""
     reasoning_in_content: bool = False
+    # Model identification from /metrics
+    model_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +93,10 @@ class MetricSnapshot:
 class MetricsCollector:
     """Thread-safe background collector for llama-server metrics."""
 
-    HEALTH_ENDPOINT  = "/health"
-    SLOTS_ENDPOINT   = "/slots"
-    METRICS_ENDPOINT = "/metrics"
+    HEALTH_ENDPOINT   = "/health"
+    SLOTS_ENDPOINT    = "/slots"
+    METRICS_ENDPOINT  = "/metrics"
+    PROPS_ENDPOINT    = "/props"
 
     def __init__(self, server_url: str = "http://127.0.0.1:8080",
                  poll_interval: float = 0.5):
@@ -407,6 +411,26 @@ class MetricsCollector:
             # If /slots succeeded we are still online.
             pass
 
+        # --- /props (optional; model name, overrides /metrics) ----------
+        # /props is a newer llama.cpp endpoint.  /metrics `llama_model_name`
+        # is a fallback when /props is unavailable.
+        if not snapshot.model_name:
+            try:
+                props_resp = requests.get(
+                    f"{self.server_url}{self.PROPS_ENDPOINT}", timeout=2.0
+                )
+                props_resp.raise_for_status()
+                props_data = props_resp.json()
+                # Prefer model_alias (short name), fall back to model_path
+                model_alias = props_data.get("model_alias", "")
+                model_path  = props_data.get("model_path", "")
+                if model_alias:
+                    snapshot.model_name = model_alias
+                elif model_path:
+                    snapshot.model_name = os.path.basename(model_path).replace(".gguf", "")
+            except requests.RequestException:
+                pass  # /props not enabled — model_name stays from /metrics
+
         self._calculate_speeds(snapshot)
         # Store raw metrics text for debug logging (thread-safe)
         with self._lock:
@@ -475,6 +499,11 @@ class MetricsCollector:
             elif metric_name in ("llamacpp:requests_deferred",
                                  "llamacpp_requests_deferred"):
                 snapshot.requests_deferred = int(value)
+
+            # Model name from /props (reliable fallback when /metrics has no llama_model_name)
+            elif metric_name == "llama_model_name":
+                if 'filename="' in line:
+                    snapshot.model_name = line.split('filename="')[1].split('"')[0]
 
    # ------------------------------------------------------------------
     # Speed calculation
@@ -648,7 +677,11 @@ def create_layout() -> Layout:
 # Panel builders
 # ---------------------------------------------------------------------------
 
-def make_header(connected: bool, error: Optional[str] = None) -> Panel:
+def make_header(
+    connected: bool,
+    server_url: str = "",
+    error: Optional[str] = None,
+) -> Panel:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     title = Text()
@@ -662,11 +695,20 @@ def make_header(connected: bool, error: Optional[str] = None) -> Panel:
         if error:
             status.append(f" ({error})", style="dim red")
 
+    # Right side: server address (stripped of scheme), then status icon
+    if server_url:
+        addr = server_url.removeprefix("https://").removeprefix("http://")
+        right = Text()
+        right.append(f"{addr}  ", style="dim yellow")
+        right.append(status)
+    else:
+        right = status
+
     header = Table.grid(expand=True)
     header.add_column(justify="left")
     header.add_column(justify="center", ratio=1)
     header.add_column(justify="right")
-    header.add_row(title, Text(now, style="bold yellow"), status)
+    header.add_row(title, Text(now, style="bold yellow"), right)
 
     return Panel(header, style="bold white on blue")
 
@@ -746,6 +788,11 @@ def make_metrics_panel(snapshot: MetricSnapshot, _frame: int = 0) -> Panel:
         r_style = "green" if snapshot.reasoning_in_content else "yellow"
         table.add_row("")
         table.add_row("Reasoning:", f"[{r_style}]{snapshot.reasoning_format}[/{r_style}]")
+
+    # --- Model identification -------------------------------------------
+    if snapshot.model_name:
+        table.add_row("")
+        table.add_row("Model:", f"[dark_orange]{snapshot.model_name}[/dark_orange]")
 
     return Panel(table, title="[bold]Metrics[/bold]", border_style="cyan")
 
@@ -997,7 +1044,7 @@ class YALDApplication:
         if self._debug_fp is not None:
             self._log_debug(raw_slots, self.collector.get_raw_metrics_text())
 
-        self.layout["header"].update(make_header(connected, error))
+        self.layout["header"].update(make_header(connected, self.collector.server_url, error))
 
         if connected:
             self.layout["metrics"].update(make_metrics_panel(snapshot, self._frame))
