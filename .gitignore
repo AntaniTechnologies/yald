@@ -20,6 +20,7 @@ env/
 *.swp
 *.swo
 *~
+AGENTS.md
 
 # Debug dumps (useful locally, not for the repo)
 *.jsonl
