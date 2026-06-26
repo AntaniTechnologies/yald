@@ -1,6 +1,5 @@
 """
 YALD - Yet Another Llama Dashboard
-v1.1.1
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -212,11 +211,14 @@ class MetricsCollector:
         # request was much larger than the current one.
         if n_prompt == 0 and self._max_context > 0:
             n_prompt = self._max_context
-        # Startup edge case: neither previous nor high-water values exist, but
-        # the slot is active and KV cache is occupied (llama-server reports
-        # n_prompt==0 after prompt consumption). Fall back to n_ctx as the
+        # Startup edge case: neither previous nor high-water values exist, and
+        # the slot has been activated by a real request (i.e. n_ctx was seen at
+        # least once and _last_slot_capacity > 0), but llama-server reports
+        # n_prompt==0 after prompt consumption. Fall back to n_ctx as the
         # best available signal that context is in use.
-        if n_prompt == 0 and n_ctx > 0:
+        # When _last_slot_capacity is still 0 (true first tick, no request sent
+        # yet), leave n_prompt at 0 so Context Usage displays 0% on startup.
+        if n_prompt == 0 and n_ctx > 0 and self._last_slot_capacity > 0:
             n_prompt = n_ctx
 
         snapshot.context_tokens            = n_prompt

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] - 2026-06-26
+
+### Fixed
+
+- Context Usage progress bar no longer shows non-zero values on startup before the first request; added a guard so the high-water fallback only activates when `_last_slot_capacity > 0` (i.e. after the slot has been activated by an actual request)
+
 ## [1.1.1] - 2026-06-25
 
 ### Fixed
