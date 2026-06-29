@@ -541,27 +541,35 @@ class MetricsCollector:
         if time_delta > 0:
             eval_delta = current.prompt_tokens_total - prev.prompt_tokens_total
             if eval_delta > 0:
-                self._prefill_avg.append(eval_delta / time_delta)
+                # FIX 3: Only add a sample to the moving average if it's
+                # within a reasonable bound (<= 499 tok/s prefill). This
+                # prevents single-sample outliers from corrupting the
+                # displayed trend before the average is even computed.
+                delta_speed = eval_delta / time_delta
+                if delta_speed <= 499:
+                    self._prefill_avg.append(delta_speed)
 
             pred_delta = current.tokens_predicted_total - prev.tokens_predicted_total
             if pred_delta > 0:
-                self._inference_avg.append(pred_delta / time_delta)
+                delta_speed = pred_delta / time_delta
+                if delta_speed <= 99:
+                    self._inference_avg.append(delta_speed)
 
         # Override with smoothed moving-average when we have samples
         if self._prefill_avg:
+            # Use average of the last N samples to avoid single-sample spikes
             current.prefill_speed = sum(self._prefill_avg) / len(self._prefill_avg)
         if self._inference_avg:
             current.inference_speed = sum(self._inference_avg) / len(self._inference_avg)
 
-        # Filter out anomalous spikes (> 999 tok/s) — keep previous value
-        if current.prefill_speed > 499:
-            prev = self._history[-1] if self._history else None
-            if prev:
-                current.prefill_speed = prev.prefill_speed
-        if current.inference_speed > 99:
-            prev = self._history[-1] if self._history else None
-            if prev:
-                current.inference_speed = prev.inference_speed
+        # Double-check: if the smoothed moving average itself is still above
+        # threshold (e.g., all recent samples were bad), fall back to the
+        # average value rather than using a raw sample that could itself be
+        # anomalous.
+        if self._prefill_avg and current.prefill_speed > 499:
+            current.prefill_speed = sum(self._prefill_avg) / len(self._prefill_avg)
+        if self._inference_avg and current.inference_speed > 99:
+            current.inference_speed = sum(self._inference_avg) / len(self._inference_avg)
 
     # ------------------------------------------------------------------
     # State log
@@ -1017,13 +1025,9 @@ class YALDApplication:
         self._running  = True
         self._frame    = 0
 
-        # Debug logging: open file handle for raw server responses
+        # Debug logging path (file handle opened lazily in run(), closed in finally)
         self._debug_path = debug_file
-        if debug_file:
-            self._debug_fp = open(debug_file, "w", buffering=1)  # line-buffered
-            print(f"[YALD] Debug log: {debug_file}")
-        else:
-            self._debug_fp = None
+        self._debug_fp: Optional[any] = None  # type: ignore[assignment]
 
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1071,6 +1075,15 @@ class YALDApplication:
         self.layout["footer"].update(make_footer(self.collector))
 
     def run(self) -> None:
+        # Open debug file lazily here so the handle is scoped to run()'s
+        # lifecycle — even if run() is never called the file is never
+        # opened, and if it is closed abnormally the finally below
+        # guarantees cleanup.
+        self._debug_fp: Optional[any] = None  # type: ignore[assignment]
+        if self._debug_path:
+            self._debug_fp = open(self._debug_path, "w", buffering=1)  # line-buffered
+            print(f"[YALD] Debug log: {self._debug_path}")
+
         self.collector.start()
         try:
             with Live(

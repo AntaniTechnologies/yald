@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-06-27
+
+### Changed
+
+- Speed calculation: only add samples to moving average if within threshold
+  (<= 499 tok/s prefill, <= 99 tok/s inference) instead of post-hoc freezing
+  to the previous frame's value
+- Debug file handle: open lazily in `run()` instead of `__init__`, preventing
+  handle leaks when the app is instantiated but never executed
+
 ## [1.1.2] - 2026-06-26
 
 ### Fixed
