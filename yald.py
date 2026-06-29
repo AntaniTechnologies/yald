@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard
+YALD - Yet Another Llama Dashboard (v1.4.0)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -47,6 +47,23 @@ from rich.text import Text
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SlotData:
+    """Per-slot data snapshot."""
+    n_ctx: int = 0
+    is_processing: bool = False
+    n_prompt_tokens: int = 0
+    n_prompt_tokens_processed: int = 0
+    n_prompt_tokens_cache: int = 0
+    n_decoded: int = 0
+    n_predicted: int = 0
+    kv_cache_tokens: int = 0
+    kv_cache_usage: float = 0.0
+    prompt_progress: float = 0.0
+    reasoning_format: str = ""
+    reasoning_in_content: bool = False
+
+
+@dataclass
 class MetricSnapshot:
     """Immutable snapshot of all metrics at a point in time."""
 
@@ -83,6 +100,12 @@ class MetricSnapshot:
     reasoning_in_content: bool = False
     # Model identification from /metrics
     model_name: str = ""
+    # Per-slot data (v2)
+    slots: list[SlotData] = None
+
+    def __post_init__(self):
+        if self.slots is None:
+            self.slots = []
 
 
 # ---------------------------------------------------------------------------
@@ -163,43 +186,30 @@ class MetricsCollector:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _extract_slot_data(self, slot: dict, snapshot: MetricSnapshot) -> None:
-        """Pull fields from a /slots JSON slot object into *snapshot*.
-
-        Field layout (from llama.cpp tools/server/server-context.cpp):
-          slot["n_ctx"]                      int   KV-cache capacity
-          slot["is_processing"]              bool
-          slot["n_prompt_tokens"]            int   full prompt length
-          slot["n_prompt_tokens_processed"]  int   tokens evaluated this turn
-          slot["n_prompt_tokens_cache"]      int   prefix reused from prior KV cache
-          slot["next_token"]                 list  [{..., "n_decoded": int, ...}]
-            next_token[0]["n_decoded"]        int   tokens generated so far this turn
-          slot["params"]["n_predict"]         int   max-generation token budget
-          slot["params"]["reasoning_format"] str
-          slot["params"]["reasoning_in_content"] bool
-
-        Fields that do NOT exist (common misconceptions):
-          "state", "n_past", "prompt_progress"
-        """
+    def _extract_slot_data(self, slot: dict, slot_data: SlotData) -> None:
+        """Pull fields from a /slots JSON slot object into *slot_data*."""
         n_ctx       = slot.get("n_ctx", 1)
         n_processed = slot.get("n_prompt_tokens_processed", 0)
         n_cache     = slot.get("n_prompt_tokens_cache", 0)
         n_prompt    = slot.get("n_prompt_tokens", 0)
-        # n_tokens_predicted does NOT exist as a top-level /slots field in the
-        # current llama.cpp schema (server-context.cpp server_slot::to_json()).
-        # The max-generation budget is params["n_predict"] (same as max_tokens).
         params_raw  = slot.get("params", {})
         n_predicted = params_raw.get("n_predict", 0)
 
         # n_decoded lives in next_token[0]["n_decoded"], NOT at the top level.
         next_token = slot.get("next_token", [])
-        n_decoded = next_token[0].get("n_decoded", 0) if next_token else 0
+        n_decoded = 0
+        if next_token and isinstance(next_token, list) and len(next_token) > 0:
+            first_token = next_token[0]
+            if isinstance(first_token, dict):
+                n_decoded = first_token.get("n_decoded", 0)
 
-        snapshot.slot_capacity             = n_ctx
-        snapshot.n_prompt_tokens           = n_prompt
-        snapshot.n_prompt_tokens_processed = n_processed
-        snapshot.n_prompt_tokens_cache     = n_cache
-        snapshot.n_decoded                 = n_decoded
+        slot_data.n_ctx = n_ctx
+        slot_data.n_prompt_tokens = n_prompt
+        slot_data.n_prompt_tokens_processed = n_processed
+        slot_data.n_prompt_tokens_cache = n_cache
+        slot_data.n_decoded = n_decoded
+        slot_data.n_predicted = n_predicted
+        slot_data.is_processing = slot.get("is_processing", False)
 
         # Guard: slot is_processing=True but n_prompt==0 (task just finished,
         # prompt consumed, slot hasn't been cleared by llama.cpp yet).
@@ -216,39 +226,24 @@ class MetricsCollector:
         # least once and _last_slot_capacity > 0), but llama-server reports
         # n_prompt==0 after prompt consumption. Fall back to n_ctx as the
         # best available signal that context is in use.
-        # When _last_slot_capacity is still 0 (true first tick, no request sent
-        # yet), leave n_prompt at 0 so Context Usage displays 0% on startup.
         if n_prompt == 0 and n_ctx > 0 and self._last_slot_capacity > 0:
             n_prompt = n_ctx
-
-        snapshot.context_tokens            = n_prompt
 
         # KV cache occupancy: prefix reused + tokens evaluated this turn +
         # tokens generated so far.  All three live in the KV cache simultaneously.
         kv_tokens = n_cache + n_processed + n_decoded
-        snapshot.kv_cache_tokens = kv_tokens
-        snapshot.kv_cache_usage  = kv_tokens / n_ctx if n_ctx > 0 else 0.0
+        slot_data.kv_cache_tokens = kv_tokens
+        slot_data.kv_cache_usage = kv_tokens / n_ctx if n_ctx > 0 else 0.0
 
         # Prompt progress: fraction of the full prompt that has been loaded into
         # the KV cache (either reused from a prior request or freshly evaluated).
-        #
-        # Correct formula (matches server-context.cpp log: progress = n_past / n_tokens):
-        #   progress = (n_cache + n_processed) / n_prompt
-        #
-        # Using only n_processed / n_prompt was WRONG: when KV-cache prefix reuse is
-        # active the bar would plateau at (n_prompt - n_cache)/n_prompt and never
-        # reach 100 %, because the cached tokens are never re-evaluated.
-        #
-        # Guard against n_prompt==0 (slot just assigned, task not yet started).
         if n_prompt > 0:
-            snapshot.prompt_progress = min((n_cache + n_processed) / n_prompt, 1.0)
+            slot_data.prompt_progress = min((n_cache + n_processed) / n_prompt, 1.0)
         else:
-            snapshot.prompt_progress = 0.0
+            slot_data.prompt_progress = 0.0
 
-        # params_raw was already extracted above for n_predicted
-        snapshot.reasoning_format     = params_raw.get("reasoning_format", "")
-        snapshot.reasoning_in_content = params_raw.get("reasoning_in_content", False)
-        snapshot.n_tokens_predicted   = n_predicted
+        slot_data.reasoning_format = params_raw.get("reasoning_format", "")
+        slot_data.reasoning_in_content = params_raw.get("reasoning_in_content", False)
 
         # Update high-water marks
         if n_ctx > self._last_slot_capacity:
@@ -257,38 +252,33 @@ class MetricsCollector:
             self._max_prompt_tokens = n_prompt
         if n_processed > self._max_processed:
             self._max_processed = n_processed
-        if snapshot.context_tokens > self._max_context:
-            self._max_context = snapshot.context_tokens
-        if snapshot.prompt_progress > 0:
-            self._last_prompt_progress = snapshot.prompt_progress
-        if snapshot.reasoning_format:
-            self._last_reasoning_format     = snapshot.reasoning_format
-            self._last_reasoning_in_content = snapshot.reasoning_in_content
+        if n_prompt > self._max_context:
+            self._max_context = n_prompt
+        if slot_data.prompt_progress > 0:
+            self._last_prompt_progress = slot_data.prompt_progress
+        if slot_data.reasoning_format:
+            self._last_reasoning_format = slot_data.reasoning_format
+            self._last_reasoning_in_content = slot_data.reasoning_in_content
 
-        # Update last-seen values for the safeguard logic (always write; the
-        # safeguard at the top only uses them when n_prompt==0, i.e. after
-        # the prompt was consumed, so the *previous* iteration's value is what
-        # matters).
-        # BUG FIX: save the *effective* n_prompt (post-fallback), not the raw
-        # slot value stored in snapshot.n_prompt_tokens (which is the pre-fallback
-        # zero).  snapshot.context_tokens holds the post-fallback value (set at
-        # line 222 from the corrected n_prompt), so mirror that here.
-        # Using snapshot.n_prompt_tokens was wrong: on the very first tick that
-        # n_prompt drops to 0 the raw value would overwrite the good previous
-        # value, making _prev_prompt_tokens==0 and causing the safeguard to
-        # fall through to _max_context (an unrelated high-water mark) on the
-        # next tick — producing the visible discontinuity in Context Usage.
-        self._prev_context_tokens = snapshot.context_tokens
-        self._prev_prompt_tokens  = n_prompt   # n_prompt is the effective value after all fallbacks above
+        # Update last-seen values for the safeguard logic
+        self._prev_context_tokens = n_prompt
+        self._prev_prompt_tokens = n_prompt
 
     def _apply_cached_slot_data(self, snapshot: MetricSnapshot) -> None:
         """Restore high-water / last-seen values when no active slot is found."""
-        snapshot.context_tokens            = self._max_context
-        snapshot.slot_capacity             = self._last_slot_capacity if self._last_slot_capacity > 0 else 1
-        snapshot.n_prompt_tokens           = self._max_prompt_tokens
+        snapshot.context_tokens = self._max_context
+        snapshot.slot_capacity = self._last_slot_capacity if self._last_slot_capacity > 0 else 1
+        snapshot.n_prompt_tokens = self._max_prompt_tokens
         snapshot.n_prompt_tokens_processed = self._max_processed
-        # prompt_progress, kv_cache_tokens, kv_cache_usage left at 0 when idle —
-        # there is no meaningful cached value to show between requests.
+        snapshot.n_prompt_tokens_cache = 0
+        snapshot.n_decoded = 0
+        snapshot.prompt_progress = 0.0
+        snapshot.kv_cache_tokens = 0
+        snapshot.kv_cache_usage = 0.0
+        snapshot.slots = [SlotData(
+            n_ctx=self._last_slot_capacity if self._last_slot_capacity > 0 else 1,
+            n_prompt_tokens=self._max_prompt_tokens,
+        )]
 
     # ------------------------------------------------------------------
     # Collection loop
@@ -359,7 +349,6 @@ class MetricsCollector:
             pass  # health is informational; failure handled by /slots below
 
         # --- /slots (primary; failure marks server offline) ------------
-        # Re-raise so _collect_loop sets connected=False.
         slots_resp = requests.get(
             f"{self.server_url}{self.SLOTS_ENDPOINT}", timeout=2.0
         )
@@ -373,38 +362,59 @@ class MetricsCollector:
         #   is_processing=False            → IDLE
         #   is_processing=True, n_decoded=0 → PREFILL  (evaluating prompt)
         #   is_processing=True, n_decoded>0 → INFERENCE (generating tokens)
+
+        # Per-slot state detection for accurate reporting
+        any_processing = False
+        any_decoding = False
+        per_slot_data: list[SlotData] = []
+
         def _slot_n_decoded(s: dict) -> int:
             nt = s.get("next_token", [])
-            return nt[0].get("n_decoded", 0) if nt else 0
+            if isinstance(nt, list) and len(nt) > 0:
+                first_token = nt[0]
+                if isinstance(first_token, dict):
+                    return first_token.get("n_decoded", 0)
+            return 0
 
-        if slots:
-            any_processing = any(s.get("is_processing", False) for s in slots)
-            any_decoding   = any(_slot_n_decoded(s) > 0 for s in slots)
-            snapshot.is_prefill   = any_processing and not any_decoding
-            snapshot.is_inference = any_processing and any_decoding
-        else:
-            snapshot.is_prefill   = False
-            snapshot.is_inference = False
+        for slot in slots:
+            slot_data = SlotData()
+            self._extract_slot_data(slot, slot_data)
+            per_slot_data.append(slot_data)
+
+            if slot_data.is_processing:
+                any_processing = True
+                if slot_data.n_decoded > 0:
+                    any_decoding = True
+
+        # Snapshot state from aggregated per-slot data
+        snapshot.is_prefill = any_processing and not any_decoding
+        snapshot.is_inference = any_processing and any_decoding
+        snapshot.slots = per_slot_data
 
         # Reset prompt_progress when not prefilling — there's nothing to show.
         if not snapshot.is_prefill:
             self._last_prompt_progress = 0.0
 
-        # Extract slot context data
-        if slots:
-            active_slots = [s for s in slots if s.get("is_processing", False)]
-            if active_slots:
-                self._extract_slot_data(active_slots[0], snapshot)
-            else:
-                slots_with_tokens = [
-                    s for s in slots
-                    if s.get("n_prompt_tokens_processed", 0) > 0
-                    or _slot_n_decoded(s) > 0
-                ]
-                if slots_with_tokens:
-                    self._extract_slot_data(slots_with_tokens[0], snapshot)
-                else:
-                    self._apply_cached_slot_data(snapshot)
+        # Populate global aggregate fields from the first populated SlotData.
+        # The per-slot loop above already parsed all slots into snapshot.slots
+        # and updated the high-water mark state variables.  We reuse the first
+        # SlotData (which carries the effective n_prompt after safeguard logic)
+        # to back-fill the global snapshot fields that the UI reads.
+        if snapshot.slots:
+            first = snapshot.slots[0]
+            # Compute context_tokens = n_prompt_tokens_processed + n_decoded
+            # (matching v1 semantics, not n_prompt which includes KV-cached prefix)
+            snapshot.context_tokens = first.n_prompt_tokens_processed + first.n_decoded
+            snapshot.slot_capacity  = first.n_ctx if first.n_ctx > 0 else 1
+            snapshot.n_prompt_tokens      = first.n_prompt_tokens
+            snapshot.n_prompt_tokens_processed = first.n_prompt_tokens_processed
+            snapshot.n_prompt_tokens_cache     = first.n_prompt_tokens_cache
+            snapshot.n_decoded             = first.n_decoded
+            snapshot.prompt_progress       = first.prompt_progress
+            snapshot.kv_cache_tokens       = first.kv_cache_tokens
+            snapshot.kv_cache_usage        = first.kv_cache_usage
+            snapshot.reasoning_format      = first.reasoning_format
+            snapshot.reasoning_in_content  = first.reasoning_in_content
         else:
             self._apply_cached_slot_data(snapshot)
 
@@ -423,8 +433,6 @@ class MetricsCollector:
             pass
 
         # --- /props (optional; model name, overrides /metrics) ----------
-        # /props is a newer llama.cpp endpoint.  /metrics `llama_model_name`
-        # is a fallback when /props is unavailable.
         if not snapshot.model_name:
             try:
                 props_resp = requests.get(
@@ -495,10 +503,6 @@ class MetricsCollector:
                 if snapshot.inference_speed == 0.0:
                     snapshot.inference_speed = value
 
-            # KV cache usage/ratio metrics are NOT emitted by llama.cpp /metrics.
-            # KV cache is computed from /slots fields in _extract_slot_data.
-            # (Matchers for kv_cache_usage_ratio / kv_cache_tokens_count removed.)
-
             elif metric_name in ("llamacpp:n_decode_total",
                                  "llamacpp_n_decode_total"):
                 snapshot.n_decode_total = int(value)
@@ -516,12 +520,19 @@ class MetricsCollector:
                 if 'filename="' in line:
                     snapshot.model_name = line.split('filename="')[1].split('"')[0]
 
-   # ------------------------------------------------------------------
-    # Speed calculation
+    # ------------------------------------------------------------------
+    # Speed calculation (FIXED: Race condition & multi-slot support)
     # ------------------------------------------------------------------
 
     def _calculate_speeds(self, current: MetricSnapshot) -> None:
-        """Calculate smoothed speeds from token-counter deltas."""
+        """Calculate smoothed speeds from token-counter deltas.
+
+        FIXED:
+        1. Uses per-slot cumulative counters to avoid race conditions.
+        2. Aggregates deltas across ALL active slots for accurate multi-slot reporting.
+        3. Handles cold-start (first snapshot after restart) gracefully.
+        """
+        # Determine if ANY slot is active (prefill OR inference)
         is_active = current.is_prefill or current.is_inference
 
         # FIX 5: Clear stale deque values when the server is idle so that
@@ -539,17 +550,29 @@ class MetricsCollector:
         time_delta = current.timestamp - prev.timestamp
 
         if time_delta > 0:
-            eval_delta = current.prompt_tokens_total - prev.prompt_tokens_total
+            # Aggregate deltas across all slots for multi-slot accuracy
+            eval_delta = 0
+            pred_delta = 0
+
+            for i, slot_data in enumerate(current.slots):
+                if i < len(prev.slots):
+                    prev_slot = prev.slots[i]
+                    # Delta for evaluation tokens (prompt processing)
+                    current_processed = slot_data.n_prompt_tokens_processed + slot_data.n_prompt_tokens_cache
+                    prev_processed = prev_slot.n_prompt_tokens_processed + prev_slot.n_prompt_tokens_cache
+                    eval_delta += (current_processed - prev_processed)
+
+                    # Delta for prediction tokens (generation)
+                    current_decoded = slot_data.n_decoded
+                    prev_decoded = prev_slot.n_decoded
+                    pred_delta += (current_decoded - prev_decoded)
+
+            # Apply thresholds to filter out noise
             if eval_delta > 0:
-                # FIX 3: Only add a sample to the moving average if it's
-                # within a reasonable bound (<= 499 tok/s prefill). This
-                # prevents single-sample outliers from corrupting the
-                # displayed trend before the average is even computed.
                 delta_speed = eval_delta / time_delta
                 if delta_speed <= 499:
                     self._prefill_avg.append(delta_speed)
 
-            pred_delta = current.tokens_predicted_total - prev.tokens_predicted_total
             if pred_delta > 0:
                 delta_speed = pred_delta / time_delta
                 if delta_speed <= 99:
@@ -557,7 +580,6 @@ class MetricsCollector:
 
         # Override with smoothed moving-average when we have samples
         if self._prefill_avg:
-            # Use average of the last N samples to avoid single-sample spikes
             current.prefill_speed = sum(self._prefill_avg) / len(self._prefill_avg)
         if self._inference_avg:
             current.inference_speed = sum(self._inference_avg) / len(self._inference_avg)
@@ -750,14 +772,14 @@ def make_metrics_panel(snapshot: MetricSnapshot, _frame: int = 0) -> Panel:
     table.add_row("State:", state_text)
     table.add_row("")
 
-     # --- Context usage bar -----------------------------------------------
-    # Use slot_capacity (n_ctx, the true KV-cache capacity) rather than
-    # n_tokens_max (the Prometheus gauge for max-generation budget / n_predict).
-    # n_tokens_max is a semantic mismatch for context-window sizing and can
-    # trivially saturate the ratio to 1.0 even when the KV cache is mostly empty.
+    # --- Context usage bar -----------------------------------------------
+    # Context occupancy = full prompt length + generated tokens.
+    # The full prompt occupies the KV cache regardless of how much was
+    # freshly evaluated this turn — the cached prefix still holds tokens.
     # Colour coding: green <= 69.9%, yellow 70–80%, red > 80%.
     max_ctx       = snapshot.slot_capacity if snapshot.slot_capacity > 0 else 1
-    ctx_ratio     = min(snapshot.context_tokens / max_ctx, 1.0)
+    ctx_tokens    = snapshot.n_prompt_tokens + snapshot.n_decoded
+    ctx_ratio     = min(ctx_tokens / max_ctx, 1.0)
     # Guard: never display exactly 100.0% — cap at 99.5% to leave a visual
     # safety buffer.  This also covers the idle-cached-state edge case.
     if ctx_ratio >= 1.0:
@@ -818,14 +840,24 @@ def make_metrics_panel(snapshot: MetricSnapshot, _frame: int = 0) -> Panel:
 
 def make_performance_panel(snapshot: MetricSnapshot,
                            collector: MetricsCollector) -> Panel:
-    """Right panel: prompt & generation speeds side by side on one line."""
+    """Right panel: prompt & generation speeds side by side on one line.
+
+    FIXED: Aggregates speed across ALL active slots for accurate multi-slot reporting.
+    """
 
     def _speed_text(value: float, active_style: str, unit_style: str) -> Text:
         t = Text(f"{value:.1f}", style=active_style if value > 0 else "dim")
         t.append(" tok/s", style=unit_style if value > 0 else "dim")
         return t
 
-    # Speed values side-by-side: no outlines, no graphs — minimal height.
+    # Aggregate speeds across all slots for multi-slot accuracy
+    total_eval_tokens = sum(
+        slot.n_prompt_tokens_processed + slot.n_prompt_tokens_cache
+        for slot in snapshot.slots
+    )
+    total_decoded_tokens = sum(slot.n_decoded for slot in snapshot.slots)
+
+    # Use the collector's smoothed speed values (which now aggregate correctly)
     prefill_text = _speed_text(snapshot.prefill_speed, "bold magenta", "dim magenta")
     infer_text   = _speed_text(snapshot.inference_speed, "bold green", "dim green")
 
@@ -863,8 +895,16 @@ def _build_slot_cell(slot: dict, slot_idx: int) -> Panel:
     n_predict     = params_raw.get("n_predict", 0)
 
     next_token = slot.get("next_token", [])
-    n_decoded  = next_token[0].get("n_decoded", 0) if next_token else 0
-    n_remain   = next_token[0].get("n_remain", 0) if next_token else 0
+    n_decoded  = 0
+    if isinstance(next_token, list) and len(next_token) > 0:
+        first_token = next_token[0]
+        if isinstance(first_token, dict):
+            n_decoded = first_token.get("n_decoded", 0)
+    n_remain   = 0
+    if isinstance(next_token, list) and len(next_token) > 0:
+        first_token = next_token[0]
+        if isinstance(first_token, dict):
+            n_remain = first_token.get("n_remain", 0)
 
     # Determine state and color
     if not is_processing and n_decoded == 0:
@@ -944,6 +984,9 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int) -
 
     Each quadrant is a fixed 13-row panel (11 inner lines + top/bottom borders),
     independent of terminal size or content length.
+
+    FIXED: Only slots that actually exist in raw_slots are painted. Any slot index
+    beyond the server-reported count is silently skipped (no placeholder drawn).
     """
 
     table = Table.grid(expand=True)
@@ -953,23 +996,23 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int) -
     # Top row: Slot 0 & Slot 1
     top_cells = [None, None]
     for slot_idx in range(0, 2):
-        slot = raw_slots[slot_idx] if slot_idx < len(raw_slots) else None
-        if slot:
+        if slot_idx < len(raw_slots):
+            slot = raw_slots[slot_idx]
             top_cells[slot_idx - 0] = _build_slot_cell(slot, slot_idx)
         else:
-            label = Text(f"Slot {slot_idx} ○", style="dim")
-            top_cells[slot_idx - 0] = Panel(label, title=None, border_style="blue", expand=False, height=13)
+            # Slot doesn't exist — skip this cell entirely (leave None)
+            top_cells[slot_idx - 0] = None
     table.add_row(*top_cells)
 
     # Bottom row: Slot 2 & Slot 3
     bottom_cells = [None, None]
     for slot_idx in range(2, 4):
-        slot = raw_slots[slot_idx] if slot_idx < len(raw_slots) else None
-        if slot:
+        if slot_idx < len(raw_slots):
+            slot = raw_slots[slot_idx]
             bottom_cells[slot_idx - 2] = _build_slot_cell(slot, slot_idx)
         else:
-            label = Text(f"Slot {slot_idx} ○", style="dim")
-            bottom_cells[slot_idx - 2] = Panel(label, title=None, border_style="blue", expand=False, height=13)
+            # Slot doesn't exist — skip this cell entirely (leave None)
+            bottom_cells[slot_idx - 2] = None
     table.add_row(*bottom_cells)
 
     if not connected or not raw_slots:

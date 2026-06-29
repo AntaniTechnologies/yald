@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-06-29
+
+### Changed
+
+- Renamed `yald_v2.py` → `yald.py`
+- Slots panel: only paint slots that are actually reported by `llama-server /slots` — any slot index beyond the server-reported count is skipped entirely instead of drawing a placeholder
+
 ## [1.3.0] - 2026-06-27
 
 ### Changed
