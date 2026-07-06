@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.0)
+YALD - Yet Another Llama Dashboard (v1.5.2)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -948,8 +948,11 @@ def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int,
 
     # --- KV cache per slot (n_cache + n_processed + n_decoded) / n_ctx ------
     kv_tokens = n_cache + n_processed + n_decoded
-    # Preserve high-watermark when slot goes idle (kv_tokens == 0)
-    if kv_tokens == 0 and slot_kv_high and slot_idx in slot_kv_high:
+    # Preserve high-watermark when slot goes idle.
+    # Use the slot's actual is_processing state (from raw slot data), not the
+    # computed idle/active display state, to determine when to use the cached
+    # high-watermark value.
+    if not is_processing and slot_kv_high and slot_idx in slot_kv_high:
         kv_tokens = slot_kv_high[slot_idx]
     kv_ratio  = min(kv_tokens / n_ctx, 1.0) if n_ctx > 0 else 0.0
     kv_filled = int(kv_ratio * 20)

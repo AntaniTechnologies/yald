@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-07-06
+
+### Fixed
+
+- **KV cache watermark display:** High watermark is now applied whenever a slot is idle
+  (`is_processing=False`) instead of only when the computed KV token count is exactly zero,
+  fixing a corner case where the KV cache progress bar showed stale values after a slot
+  transitioned from active to idle
+
 ## [1.5.1] - 2026-07-06
 
 ### Fixed
