@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-07-06
+
+### Fixed
+
+- **KV cache high watermark:** Per-slot KV cache peak is now preserved when slots go idle, so the KV cache progress bar no longer drops to 0 between generations
+- **Tokens Max display:** "Tokens Max" now shows the correct value instead of always displaying 0 — the effective `n_prompt` (after safeguard fallbacks) is used for the slot data
+- **Model name layout:** Model name is now printed on a separate line to avoid truncation in narrow terminals
+
 ## [1.5.0] - 2026-07-06
 
 ### Changed

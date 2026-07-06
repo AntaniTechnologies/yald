@@ -38,6 +38,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 
@@ -155,6 +156,8 @@ class MetricsCollector:
         self._max_processed: int     = 0
         self._max_context: int       = 0
         self._last_slot_capacity: int = 0
+        # Per-slot KV cache high-watermarks (preserved when slot goes idle)
+        self._slot_kv_high: dict[int, int] = {}
 
         # Last-seen runtime values (not maximums) — used as safeguard when a
         # value drops to 0 mid-request (e.g. prompt consumed but slot not yet
@@ -231,8 +234,11 @@ class MetricsCollector:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _extract_slot_data(self, slot: dict, slot_data: SlotData) -> None:
-        """Pull fields from a /slots JSON slot object into *slot_data*."""
+    def _extract_slot_data(self, slot: dict, slot_data: SlotData, slot_idx: int = 0) -> None:
+        """Pull fields from a /slots JSON slot object into *slot_data*.
+        
+        *slot_idx* is used to track per-slot KV cache high-watermarks.
+        """
         n_ctx       = slot.get("n_ctx", 1)
         n_processed = slot.get("n_prompt_tokens_processed", 0)
         n_cache     = slot.get("n_prompt_tokens_cache", 0)
@@ -249,7 +255,6 @@ class MetricsCollector:
                 n_decoded = first_token.get("n_decoded", 0)
 
         slot_data.n_ctx = n_ctx
-        slot_data.n_prompt_tokens = n_prompt
         slot_data.n_prompt_tokens_processed = n_processed
         slot_data.n_prompt_tokens_cache = n_cache
         slot_data.n_decoded = n_decoded
@@ -290,6 +295,9 @@ class MetricsCollector:
         slot_data.reasoning_format = params_raw.get("reasoning_format", "")
         slot_data.reasoning_in_content = params_raw.get("reasoning_in_content", False)
 
+        # Assign n_prompt after safeguard logic so the effective value is used
+        slot_data.n_prompt_tokens = n_prompt
+
         # Update high-water marks
         if n_ctx > self._last_slot_capacity:
             self._last_slot_capacity = n_ctx
@@ -304,6 +312,12 @@ class MetricsCollector:
         if slot_data.reasoning_format:
             self._last_reasoning_format = slot_data.reasoning_format
             self._last_reasoning_in_content = slot_data.reasoning_in_content
+
+        # KV cache high-watermark (preserved when slot goes idle)
+        kv_tokens = n_cache + n_processed + n_decoded
+        if kv_tokens > 0:
+            if slot_idx not in self._slot_kv_high or kv_tokens > self._slot_kv_high[slot_idx]:
+                self._slot_kv_high[slot_idx] = kv_tokens
 
         # Update last-seen values for the safeguard logic
         self._prev_context_tokens = n_prompt
@@ -355,7 +369,7 @@ class MetricsCollector:
                 if self._consecutive_failures >= 2:
                     self._connected  = False
                     self._last_error = "Connection refused"
-            except aiohttp.ClientTimeout:
+            except asyncio.TimeoutError:
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= 2:
                     self._connected  = False
@@ -418,9 +432,9 @@ class MetricsCollector:
         any_decoding = False
         per_slot_data: list[SlotData] = []
 
-        for slot in slots:
+        for slot_idx, slot in enumerate(slots):
             slot_data = SlotData()
-            self._extract_slot_data(slot, slot_data)
+            self._extract_slot_data(slot, slot_data, slot_idx)
             per_slot_data.append(slot_data)
 
             if slot_data.is_processing:
@@ -679,6 +693,10 @@ class MetricsCollector:
         """Return the most recent raw /slots list."""
         return list(self._raw_slots)
 
+    def get_slot_kv_high(self) -> dict[int, int]:
+        """Return the per-slot KV cache high-watermark dictionary."""
+        return dict(self._slot_kv_high)
+
 
 # ---------------------------------------------------------------------------
 # Layout builder
@@ -824,7 +842,11 @@ def make_metrics_panel(snapshot: MetricSnapshot, _frame: int = 0) -> Panel:
     # --- Model identification -------------------------------------------
     if snapshot.model_name:
         table.add_row("")
-        table.add_row("Model:", f"[dark_orange]{snapshot.model_name}[/dark_orange]")
+        table.add_row("Model:", "")
+        model_table = Table(expand=True, show_header=False, show_footer=False, box=None)
+        model_table.add_column(style="dark_orange")
+        model_table.add_row(snapshot.model_name)
+        return Panel(Group(table, model_table), title="[bold]Metrics[/bold]", border_style="cyan")
 
     return Panel(table, title="[bold]Metrics[/bold]", border_style="cyan")
 
@@ -869,7 +891,7 @@ def make_performance_panel(snapshot: MetricSnapshot,
     return Panel(perf_table, title="[bold]Performance[/bold]", border_style="green", padding=(0, 0))
 
 
-def _build_slot_cell(slot: dict, slot_idx: int) -> Panel:
+def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int, int]] = None) -> Panel:
     """Build a single cell for one slot quadrant with state, progress bars, tokens.
 
     Fixed inner height of 11 lines, yielding exactly 13 character rows
@@ -926,6 +948,9 @@ def _build_slot_cell(slot: dict, slot_idx: int) -> Panel:
 
     # --- KV cache per slot (n_cache + n_processed + n_decoded) / n_ctx ------
     kv_tokens = n_cache + n_processed + n_decoded
+    # Preserve high-watermark when slot goes idle (kv_tokens == 0)
+    if kv_tokens == 0 and slot_kv_high and slot_idx in slot_kv_high:
+        kv_tokens = slot_kv_high[slot_idx]
     kv_ratio  = min(kv_tokens / n_ctx, 1.0) if n_ctx > 0 else 0.0
     kv_filled = int(kv_ratio * 20)
     kv_bar    = "█" * kv_filled + "░" * (20 - kv_filled)
@@ -970,7 +995,8 @@ def _build_slot_cell(slot: dict, slot_idx: int) -> Panel:
     return Panel(inner, title=None, border_style=border_style, expand=False, height=13)
 
 
-def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int) -> Panel:
+def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int,
+                     slot_kv_high: Optional[dict[int, int]] = None) -> Panel:
     """Slots panel: 4 quadrants (Slot 0-3) with state, generation/prompt/KV progress bars.
 
     Each quadrant is a fixed 13-row panel (11 inner lines + top/bottom borders),
@@ -989,7 +1015,7 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int) -
     for slot_idx in range(0, 2):
         if slot_idx < len(raw_slots):
             slot = raw_slots[slot_idx]
-            top_cells[slot_idx - 0] = _build_slot_cell(slot, slot_idx)
+            top_cells[slot_idx - 0] = _build_slot_cell(slot, slot_idx, slot_kv_high)
         else:
             # Slot doesn't exist — skip this cell entirely (leave None)
             top_cells[slot_idx - 0] = None
@@ -1000,7 +1026,7 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int) -
     for slot_idx in range(2, 4):
         if slot_idx < len(raw_slots):
             slot = raw_slots[slot_idx]
-            bottom_cells[slot_idx - 2] = _build_slot_cell(slot, slot_idx)
+            bottom_cells[slot_idx - 2] = _build_slot_cell(slot, slot_idx, slot_kv_high)
         else:
             # Slot doesn't exist — skip this cell entirely (leave None)
             bottom_cells[slot_idx - 2] = None
@@ -1101,7 +1127,8 @@ class YALDApplication:
                 make_performance_panel(snapshot, self.collector)
             )
             self.layout["slots"].update(
-                make_slots_panel(connected, raw_slots, height)
+                make_slots_panel(connected, raw_slots, height,
+                                 self.collector.get_slot_kv_high())
             )
         else:
             self.layout["body"].update(make_offline_panel(error or "Unknown error"))
