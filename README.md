@@ -6,7 +6,7 @@ One file. One command. One screen. Zero fuss.
 ## Prerequisites
 
 - Python 3.10+
-- A running llama-server instance with `--metrics` flag (e.g., from llama.cpp)
+- A running llama-server instance with `--metrics --slot` flags (e.g., from llama.cpp)
 
 ## Installation
 
