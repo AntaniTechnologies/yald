@@ -11,7 +11,7 @@ One file. One command. One screen. Zero fuss.
 ## Installation
 
 ```bash
-pip install rich requests
+pip install rich aiohttp
 python yald.py
 ```
 
@@ -36,7 +36,7 @@ The dashboard is split into a few panels:
 ## Dependencies
 
 - [rich](https://github.com/Textualize/rich) -- terminal rendering
-- [requests](https://requests.readthedocs.io/) -- HTTP polling
+- [aiohttp](https://docs.aiohttp.org/) -- async HTTP client
 
 ## License
 
