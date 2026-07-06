@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.4.0)
+YALD - Yet Another Llama Dashboard (v1.5.0)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -23,17 +23,17 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import asyncio
 import json
 import os
 import signal
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-import requests
+import aiohttp
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -95,7 +95,7 @@ class MetricSnapshot:
     kv_cache_tokens: int = 0       # total tokens occupying KV cache
     # Totals
     n_decode_total: int = 0
-   # Reasoning (model-specific)
+    # Reasoning (model-specific)
     reasoning_format: str = ""
     reasoning_in_content: bool = False
     # Model identification from /metrics
@@ -113,7 +113,12 @@ class MetricSnapshot:
 # ---------------------------------------------------------------------------
 
 class MetricsCollector:
-    """Thread-safe background collector for llama-server metrics."""
+    """Async background collector for llama-server metrics.
+
+    Replaces threading.Lock + polling Thread with a single asyncio loop.
+    Because the event loop is single-threaded, all mutations to shared state
+    are inherently serial — no lock is ever needed.
+    """
 
     HEALTH_ENDPOINT   = "/health"
     SLOTS_ENDPOINT    = "/slots"
@@ -125,9 +130,9 @@ class MetricsCollector:
         self.server_url    = server_url
         self.poll_interval = poll_interval
 
-        self._lock    = threading.Lock()
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._poll_task: Optional[asyncio.Task[None]] = None
+        self._session: Optional[aiohttp.ClientSession] = None
 
         self._current: MetricSnapshot = MetricSnapshot(timestamp=time.time())
         self._history: list[MetricSnapshot] = []
@@ -142,7 +147,7 @@ class MetricsCollector:
         self._log_max   = 10
         self._last_state: str = ""      # FIX 9: empty so first IDLE is recorded
 
-        # Raw /slots list for per-slot UI (thread-safe)
+        # Raw /slots list for per-slot UI
         self._raw_slots: list[dict] = []
 
         # Persistent "high-water" values so the UI doesn't reset to 0 mid-session
@@ -165,22 +170,62 @@ class MetricsCollector:
         self._prefill_avg: deque[float]   = deque(maxlen=10)
         self._inference_avg: deque[float] = deque(maxlen=10)
 
-        # Raw /metrics text for debug logging (thread-safe)
-        self._raw_metrics_text: Optional[str] = None
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
+    async def start(self) -> None:
         self._running = True
-        self._thread  = threading.Thread(target=self._collect_loop, daemon=True)
-        self._thread.start()
+        self._session = aiohttp.ClientSession()
+        self._poll_task = asyncio.create_task(self._poll_loop())
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    # ------------------------------------------------------------------
+    # aiohttp helpers
+    # ------------------------------------------------------------------
+
+    async def _fetch_text(
+        self, session: aiohttp.ClientSession, endpoint: str,
+        ignore_errors: bool = False,
+    ) -> Optional[str]:
+        """Fetch raw text from *endpoint*.  Raises on error unless *ignore_errors*."""
+        timeout = aiohttp.ClientTimeout(total=2.0)
+        try:
+            async with session.get(
+                f"{self.server_url}{endpoint}", timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.text()
+        except Exception:
+            if ignore_errors:
+                return None
+            raise
+
+    async def _fetch_json(
+        self, session: aiohttp.ClientSession, endpoint: str,
+        ignore_errors: bool = False,
+    ) -> Optional[dict | list]:
+        """Fetch JSON from *endpoint*.  Returns None on error if *ignore_errors*."""
+        try:
+            text = await self._fetch_text(session, endpoint, ignore_errors=False)
+            if text is None:
+                return None
+            return json.loads(text)
+        except Exception:
+            if ignore_errors:
+                return None
+            raise
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -284,77 +329,82 @@ class MetricsCollector:
     # Collection loop
     # ------------------------------------------------------------------
 
-    def _collect_loop(self) -> None:
+    async def _poll_loop(self) -> None:
+        """Async polling loop — runs until *stop()* cancels this task."""
         while self._running:
             try:
-                snapshot = self._fetch_and_parse()
+                snapshot = await self._fetch_and_parse()
                 self._update_state(snapshot)
 
-                with self._lock:
-                    self._current = snapshot
-                    self._history.append(snapshot)
-                    if len(self._history) > self._history_max:
-                        self._history.pop(0)
-                    self._consecutive_failures = 0
-                    if not self._connected:
-                        self._success_after_offline += 1
-                        if self._success_after_offline >= 2:
-                            self._connected = True
-                            self._success_after_offline = 0
-                            self._last_error = None
-                    else:
+                self._current = snapshot
+                self._history.append(snapshot)
+                if len(self._history) > self._history_max:
+                    self._history.pop(0)
+                self._consecutive_failures = 0
+                if not self._connected:
+                    self._success_after_offline += 1
+                    if self._success_after_offline >= 2:
+                        self._connected = True
+                        self._success_after_offline = 0
                         self._last_error = None
+                else:
+                    self._last_error = None
 
-            except requests.ConnectionError:
-                with self._lock:
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures >= 2:
-                        self._connected  = False
-                        self._last_error = "Connection refused"
-            except requests.Timeout:
-                with self._lock:
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures >= 2:
-                        self._connected  = False
-                        self._last_error = "Request timeout"
-            except requests.HTTPError as e:
-                with self._lock:
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures >= 2:
-                        self._connected  = False
-                        self._last_error = f"HTTP {e.response.status_code}"
+            except aiohttp.ClientConnectionError:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 2:
+                    self._connected  = False
+                    self._last_error = "Connection refused"
+            except aiohttp.ClientTimeout:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 2:
+                    self._connected  = False
+                    self._last_error = "Request timeout"
+            except aiohttp.ClientResponseError as e:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 2:
+                    self._connected  = False
+                    self._last_error = f"HTTP {e.status}"
             except Exception as e:
-                with self._lock:
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures >= 2:
-                        self._connected  = False
-                        self._last_error = str(e)
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 2:
+                    self._connected  = False
+                    self._last_error = str(e)
 
-            time.sleep(self.poll_interval)
+            await asyncio.sleep(self.poll_interval)
 
     # ------------------------------------------------------------------
     # Fetch + parse
     # ------------------------------------------------------------------
 
-    def _fetch_and_parse(self) -> MetricSnapshot:
-        """Fetch /slots and /metrics; build and return a MetricSnapshot."""
-        now      = time.time()
+    async def _fetch_and_parse(self) -> MetricSnapshot:
+        """Fan out /health, /slots, /metrics, /props concurrently, then parse."""
+        now = time.time()
         snapshot = MetricSnapshot(timestamp=now)
 
-        # --- /health (optional; just to prime connection check) --------
-        try:
-            r = requests.get(f"{self.server_url}{self.HEALTH_ENDPOINT}", timeout=2.0)
-            r.raise_for_status()
-        except requests.RequestException:
-            pass  # health is informational; failure handled by /slots below
+        # ---- concurrent fan-out of all four endpoints -----------------
+        session = self._session  # guaranteed non-None after start()
 
-        # --- /slots (primary; failure marks server offline) ------------
-        slots_resp = requests.get(
-            f"{self.server_url}{self.SLOTS_ENDPOINT}", timeout=2.0
+        # /slots is the primary endpoint — its failure means offline.
+        # All others are optional: we use a sentinel to distinguish
+        # "not fetched" from "fetched but empty".
+        _SENTINEL = object()
+
+        # Fetch /slots (required) alongside /health, /metrics, /props (optional)
+        health_ok, slots_resp, metrics_text, props_resp = await asyncio.gather(
+            self._health_check(session),
+            self._fetch_slots(session),
+            self._fetch_metrics_text(session),
+            self._fetch_props(session),
         )
-        slots_resp.raise_for_status()
-        slots: list[dict] = slots_resp.json()
+
+        # If /slots failed, propagate the exception (handled in _poll_loop)
+        # Otherwise slots_resp is a list
+        slots: list[dict] = slots_resp  # type: ignore[assignment]
         self._raw_slots = slots
+
+        # --- /health (informational — success just confirms connectivity)
+        # No action needed; health_ok is True when the endpoint responded.
 
         # State detection: "state" integer is NOT in the /slots JSON.
         # Use is_processing (bool, top-level) combined with n_decoded which is
@@ -367,14 +417,6 @@ class MetricsCollector:
         any_processing = False
         any_decoding = False
         per_slot_data: list[SlotData] = []
-
-        def _slot_n_decoded(s: dict) -> int:
-            nt = s.get("next_token", [])
-            if isinstance(nt, list) and len(nt) > 0:
-                first_token = nt[0]
-                if isinstance(first_token, dict):
-                    return first_token.get("n_decoded", 0)
-            return 0
 
         for slot in slots:
             slot_data = SlotData()
@@ -418,43 +460,49 @@ class MetricsCollector:
         else:
             self._apply_cached_slot_data(snapshot)
 
-        # --- /metrics (optional; failure does NOT mark server offline) -
-        raw_metrics_text: Optional[str] = None
-        try:
-            metrics_resp = requests.get(
-                f"{self.server_url}{self.METRICS_ENDPOINT}", timeout=2.0
-            )
-            metrics_resp.raise_for_status()
-            raw_metrics_text = metrics_resp.text
-            self._parse_prometheus(raw_metrics_text, snapshot)
-        except requests.RequestException:
-            # /metrics may not be enabled (needs --metrics flag).
-            # If /slots succeeded we are still online.
-            pass
+        # --- /metrics (optional; failure does NOT mark server offline) ---
+        if metrics_text is not None:
+            self._parse_prometheus(metrics_text, snapshot)
 
         # --- /props (optional; model name, overrides /metrics) ----------
-        if not snapshot.model_name:
-            try:
-                props_resp = requests.get(
-                    f"{self.server_url}{self.PROPS_ENDPOINT}", timeout=2.0
-                )
-                props_resp.raise_for_status()
-                props_data = props_resp.json()
-                # Prefer model_alias (short name), fall back to model_path
-                model_alias = props_data.get("model_alias", "")
-                model_path  = props_data.get("model_path", "")
-                if model_alias:
-                    snapshot.model_name = model_alias
-                elif model_path:
-                    snapshot.model_name = os.path.basename(model_path).replace(".gguf", "")
-            except requests.RequestException:
-                pass  # /props not enabled — model_name stays from /metrics
+        if not snapshot.model_name and props_resp is not None:
+            # Prefer model_alias (short name), fall back to model_path
+            model_alias = props_resp.get("model_alias", "")
+            model_path  = props_resp.get("model_path", "")
+            if model_alias:
+                snapshot.model_name = model_alias
+            elif model_path:
+                snapshot.model_name = os.path.basename(model_path).replace(".gguf", "")
 
         self._calculate_speeds(snapshot)
-        # Store raw metrics text for debug logging (thread-safe)
-        with self._lock:
-            self._raw_metrics_text = raw_metrics_text
         return snapshot
+
+    async def _health_check(self, session: aiohttp.ClientSession) -> bool:
+        """Return True if /health responded with 2xx."""
+        try:
+            await self._fetch_text(session, self.HEALTH_ENDPOINT)
+            return True
+        except Exception:
+            return False
+
+    async def _fetch_slots(self, session: aiohttp.ClientSession) -> list[dict]:
+        """Fetch /slots.  Raises on error — this is the primary endpoint."""
+        text = await self._fetch_text(session, self.SLOTS_ENDPOINT)
+        return json.loads(text)  # type: ignore[return-value]
+
+    async def _fetch_metrics_text(self, session: aiohttp.ClientSession) -> Optional[str]:
+        """Fetch /metrics text.  Returns None if unavailable."""
+        try:
+            return await self._fetch_text(session, self.METRICS_ENDPOINT)
+        except Exception:
+            return None
+
+    async def _fetch_props(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        """Fetch /props JSON.  Returns None if unavailable."""
+        try:
+            return await self._fetch_json(session, self.PROPS_ENDPOINT)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Prometheus parser
@@ -606,87 +654,30 @@ class MetricsCollector:
             current_state = "IDLE"
 
         if current_state != self._last_state:
-            with self._lock:
-                self._state_log.append((snapshot.timestamp, current_state))
-                if len(self._state_log) > self._log_max:
-                    self._state_log.pop(0)
+            self._state_log.append((snapshot.timestamp, current_state))
+            if len(self._state_log) > self._log_max:
+                self._state_log.pop(0)
             self._last_state = current_state
 
     # ------------------------------------------------------------------
-    # Public accessors (all thread-safe)
+    # Public accessors (no locks — single-threaded event loop)
     # ------------------------------------------------------------------
 
     def get_snapshot(self) -> MetricSnapshot:
-        with self._lock:
-            return self._current
+        return self._current
 
     def is_connected(self) -> bool:
-        with self._lock:
-            return self._connected
+        return self._connected
 
     def get_last_error(self) -> Optional[str]:
-        with self._lock:
-            return self._last_error
+        return self._last_error
 
     def get_state_log(self) -> list[tuple[float, str]]:
-        with self._lock:
-            return list(self._state_log)
-
-    def get_speed_history(self) -> tuple[list[float], list[float]]:
-        with self._lock:
-            return (
-                [s.prefill_speed   for s in self._history],
-                [s.inference_speed for s in self._history],
-            )
+        return list(self._state_log)
 
     def get_raw_slots(self) -> list[dict]:
-        """Return the most recent raw /slots list (thread-safe)."""
-        with self._lock:
-            return list(self._raw_slots)
-
-    def get_raw_metrics_text(self) -> Optional[str]:
-        """Return the most recent raw /metrics text (thread-safe)."""
-        with self._lock:
-            return self._raw_metrics_text
-
-
-# ---------------------------------------------------------------------------
-# Graph renderer
-# ---------------------------------------------------------------------------
-
-_GRAPH_CHARS = "▁▂▃▄▅▆▇█"
-
-
-def _render_graph(speeds: list[float], width: int, style: str) -> Text:
-    """Render a Unicode bar graph.  Always renders exactly *width* characters."""
-    text = Text()
-
-    if not speeds or all(v == 0 for v in speeds):
-        text.append("─" * width, style="dim")
-        return text
-
-    max_val = max(speeds)
-    if max_val <= 0:
-        text.append("─" * width, style="dim")
-        return text
-
-    # FIX 10: Trim / pad so the graph always fills exactly *width* columns.
-    # Take the *most recent* `width` samples when we have more.
-    display = speeds[-width:] if len(speeds) >= width else speeds
-    # Left-pad with dim dashes when fewer samples exist
-    pad = width - len(display)
-    if pad:
-        text.append("─" * pad, style="dim")
-
-    for v in display:
-        if v == 0:
-            text.append("▁", style="dim")
-        else:
-            # FIX in zai-yald.py already present; kept: clamp to valid index
-            level = min(len(_GRAPH_CHARS) - 1, max(0, int(v / max_val * len(_GRAPH_CHARS)) - 1))
-            text.append(_GRAPH_CHARS[level], style=style)
-
-    return text
+        """Return the most recent raw /slots list."""
+        return list(self._raw_slots)
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1091,7 @@ class YALDApplication:
 
         # Debug: write raw server responses to JSONL file
         if self._debug_fp is not None:
-            self._log_debug(raw_slots, self.collector.get_raw_metrics_text())
+            self._log_debug(raw_slots, None)
 
         self.layout["header"].update(make_header(connected, self.collector.server_url, error))
 
@@ -1117,7 +1108,7 @@ class YALDApplication:
 
         self.layout["footer"].update(make_footer(self.collector))
 
-    def run(self) -> None:
+    async def run(self) -> None:
         # Open debug file lazily here so the handle is scoped to run()'s
         # lifecycle — even if run() is never called the file is never
         # opened, and if it is closed abnormally the finally below
@@ -1127,7 +1118,7 @@ class YALDApplication:
             self._debug_fp = open(self._debug_path, "w", buffering=1)  # line-buffered
             print(f"[YALD] Debug log: {self._debug_path}")
 
-        self.collector.start()
+        await self.collector.start()
         try:
             with Live(
                 self.layout,
@@ -1140,9 +1131,9 @@ class YALDApplication:
                 while self._running:
                     self._update_layout()
                     live.update(self.layout)
-                    time.sleep(0.01)
+                    await asyncio.sleep(0.01)  # yields to event loop → collector runs
         finally:
-            self.collector.stop()
+            await self.collector.stop()
             if self._debug_fp is not None:
                 self._debug_fp.close()
 
@@ -1153,6 +1144,7 @@ class YALDApplication:
 
 def main() -> None:
     import argparse
+    import asyncio
 
     parser = argparse.ArgumentParser(description="YALD - Yet Another Llama Dashboard. \u00A9 2026 Antani Technologies BV.")
     parser.add_argument(
@@ -1166,7 +1158,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    YALDApplication(server_url=args.server, debug_file=args.debug).run()
+    app = YALDApplication(server_url=args.server, debug_file=args.debug)
+    asyncio.run(app.run())
 
 
 if __name__ == "__main__":

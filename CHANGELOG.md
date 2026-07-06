@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-07-06
+
+### Changed
+
+- **Major rewrite:** Replaced `threading.Thread` + `threading.Lock` polling with
+  `asyncio` — the event loop is single-threaded, eliminating all lock contention
+  and race conditions (`_history.append`, `_state_log` TOCTOU, etc.) entirely
+- **Concurrent endpoint fetching:** `/health`, `/slots`, `/metrics`, `/props` are
+  now fetched in parallel via `asyncio.gather()` instead of sequentially, cutting
+  worst-case poll latency from ~8s to ~2s
+- **Connection pooling:** Single `aiohttp.ClientSession` reused across polls
+- **Dependency:** Removed `requests`; `aiohttp` (already listed) is now the sole
+  HTTP client
+- `MetricsCollector.start()` and `stop()` are now `async`
+- `YALDApplication.run()` is now `async`; `main()` uses `asyncio.run()`
+
 ## [1.4.0] - 2026-06-29
 
 ### Changed
