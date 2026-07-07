@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.3)
+YALD - Yet Another Llama Dashboard (v1.5.4)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -334,10 +334,6 @@ class MetricsCollector:
         snapshot.prompt_progress = 0.0
         snapshot.kv_cache_tokens = 0
         snapshot.kv_cache_usage = 0.0
-        snapshot.slots = [SlotData(
-            n_ctx=self._last_slot_capacity if self._last_slot_capacity > 0 else 1,
-            n_prompt_tokens=self._max_prompt_tokens,
-        )]
 
     # ------------------------------------------------------------------
     # Collection loop
@@ -852,7 +848,7 @@ def make_metrics_panel(snapshot: MetricSnapshot, _frame: int = 0) -> Panel:
 
 
 def make_performance_panel(snapshot: MetricSnapshot,
-                           collector: MetricsCollector) -> Panel:
+                            collector: MetricsCollector) -> Panel:
     """Right panel: prompt & generation speeds side by side on one line.
 
     FIXED: Aggregates speed across ALL active slots for accurate multi-slot reporting.
@@ -862,13 +858,6 @@ def make_performance_panel(snapshot: MetricSnapshot,
         t = Text(f"{value:.1f}", style=active_style if value > 0 else "dim")
         t.append(" tok/s", style=unit_style if value > 0 else "dim")
         return t
-
-    # Aggregate speeds across all slots for multi-slot accuracy
-    total_eval_tokens = sum(
-        slot.n_prompt_tokens_processed + slot.n_prompt_tokens_cache
-        for slot in snapshot.slots
-    )
-    total_decoded_tokens = sum(slot.n_decoded for slot in snapshot.slots)
 
     # Use the collector's smoothed speed values (which now aggregate correctly)
     prefill_text = _speed_text(snapshot.prefill_speed, "bold magenta", "dim magenta")
@@ -927,9 +916,9 @@ def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int,
         state_text = ""
     elif is_processing and n_decoded == 0:
         state_label = f"Slot {slot_idx} ●"
-        state_style = "bold white on blue"
-        border_style = "blue"
-        state_text = "IDLE"
+        state_style = "bold white on magenta"
+        border_style = "magenta"
+        state_text = "PREFILL"
     elif is_processing and n_decoded > 0:
         state_label = f"Slot {slot_idx} ●"
         state_style = "bold white on green"

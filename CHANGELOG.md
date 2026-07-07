@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.4] - 2026-07-07
+
+### Fixed
+
+- **Slot quadrant state label:** Slot in prefill state (`is_processing=True`, `n_decoded=0`) now correctly displays "PREFILL" with magenta styling instead of incorrectly showing "IDLE" with blue styling, matching the Metrics panel's state detection logic
+- **Empty slot fallback:** Removed misleading single-slot `SlotData` creation when no active slots exist — `snapshot.slots` now correctly remains empty, preventing the slots panel from rendering a phantom slot cell
+- **Performance panel cleanup:** Removed unused local variables (`total_eval_tokens`, `total_decoded_tokens`) that were computed but never displayed; the panel now cleanly uses the collector's aggregated smoothed speed values
+
 ## [1.5.3] - 2026-07-07
 
 ### Changed
