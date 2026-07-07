@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.2)
+YALD - Yet Another Llama Dashboard (v1.5.3)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -663,7 +663,7 @@ class MetricsCollector:
         if snapshot.is_prefill:
             current_state = "PREFILL"
         elif snapshot.is_inference:
-            current_state = "INFERENCE"
+            current_state = "ACTIVE"
         else:
             current_state = "IDLE"
 
@@ -1055,8 +1055,8 @@ def make_footer(collector: MetricsCollector) -> Panel:
             time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
             if state == "PREFILL":
                 log_text.append(f"{time_str} PREFILL",   style="magenta")
-            elif state == "INFERENCE":
-                log_text.append(f"{time_str} INFERENCE", style="green")
+            elif state == "ACTIVE":
+                log_text.append(f"{time_str} ACTIVE", style="green")
             else:
                 log_text.append(f"{time_str} IDLE",      style="blue")
 

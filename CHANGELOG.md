@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.3] - 2026-07-07
+
+### Changed
+
+- **Activity log state label:** Renamed "INFERENCE" to "ACTIVE" for consistency
+  with the metrics panel state badge — both now use the same label for the
+  `is_processing && n_decoded > 0` state
+
 ## [1.5.2] - 2026-07-06
 
 ### Fixed
