@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.5] - 2026-08-02
+
+### Fixed
+
+- **Model name display:** Fixed model label showing incorrect directory path prefix (e.g., `./models`) when llama-server launched with relative paths. Now correctly extracts only the basename from:
+  - `/props` endpoint's `model_alias` and `model_path` fields
+  - `/metrics` endpoint's `llama_model_name` Prometheus metric
+- **Endpoint priority:** Fixed model name extraction order - `/props` is now correctly used as the primary source, with `/metrics` as fallback
+- Added support for alternate Prometheus metric name format (`llamacpp:llama_model_name`)
+
 ## [1.5.4] - 2026-07-07
 
 ### Fixed

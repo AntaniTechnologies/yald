@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.4)
+YALD - Yet Another Llama Dashboard (v1.5.5)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -470,19 +470,23 @@ class MetricsCollector:
         else:
             self._apply_cached_slot_data(snapshot)
 
-        # --- /metrics (optional; failure does NOT mark server offline) ---
-        if metrics_text is not None:
-            self._parse_prometheus(metrics_text, snapshot)
-
-        # --- /props (optional; model name, overrides /metrics) ----------
-        if not snapshot.model_name and props_resp is not None:
-            # Prefer model_alias (short name), fall back to model_path
+        # --- /props (primary; model name from llama.cpp props endpoint) ----------
+        # /props is the preferred source - it provides both model_alias (short name)
+        # and model_path (full path). Use model_alias if available, else basename of model_path.
+        if props_resp is not None:
             model_alias = props_resp.get("model_alias", "")
             model_path  = props_resp.get("model_path", "")
             if model_alias:
-                snapshot.model_name = model_alias
+                # model_alias should be a short name, but apply basename for safety
+                snapshot.model_name = os.path.basename(model_alias).replace(".gguf", "")
             elif model_path:
+                # Extract just the filename, remove .gguf extension
                 snapshot.model_name = os.path.basename(model_path).replace(".gguf", "")
+
+        # --- /metrics (fallback; Prometheus llama_model_name metric) ----------
+        # Only used when /props didn't provide model_name
+        if not snapshot.model_name and metrics_text is not None:
+            self._parse_prometheus(metrics_text, snapshot)
 
         self._calculate_speeds(snapshot)
         return snapshot
@@ -573,10 +577,13 @@ class MetricsCollector:
                                  "llamacpp_requests_deferred"):
                 snapshot.requests_deferred = int(value)
 
-            # Model name from /props (reliable fallback when /metrics has no llama_model_name)
-            elif metric_name == "llama_model_name":
+            # Model name from /metrics lama_model_name metric (fallback when /props unavailable)
+            elif metric_name in ("llama_model_name", "llamacpp:llama_model_name"):
+                # Handle both old format (filename="...") and potential new formats
+                # that might use different label names
                 if 'filename="' in line:
-                    snapshot.model_name = line.split('filename="')[1].split('"')[0]
+                    raw_path = line.split('filename="')[1].split('"')[0]
+                    snapshot.model_name = os.path.basename(raw_path).replace(".gguf", "")
 
     # ------------------------------------------------------------------
     # Speed calculation (FIXED: Race condition & multi-slot support)
