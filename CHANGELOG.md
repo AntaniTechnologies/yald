@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.6] - 2026-08-04
+
+### Fixed
+
+- **KV cache display when slot goes Idle:** Fixed stale KV values showing when a slot transitions from Active to Idle. The KV cache high-watermark now correctly preserves the latest value from Active state by only updating during active processing (instead of updating whenever kv_tokens > 0). This ensures the Slots panel displays the correct KV cache occupancy when slots become idle.
+
 ## [1.5.5] - 2026-08-02
 
 ### Fixed

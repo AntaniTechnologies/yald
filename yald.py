@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.5)
+YALD - Yet Another Llama Dashboard (v1.5.6)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -236,9 +236,12 @@ class MetricsCollector:
 
     def _extract_slot_data(self, slot: dict, slot_data: SlotData, slot_idx: int = 0) -> None:
         """Pull fields from a /slots JSON slot object into *slot_data*.
-        
+
         *slot_idx* is used to track per-slot KV cache high-watermarks.
         """
+        # Extract is_processing early - used for KV high-watermark guard
+        is_processing = slot.get("is_processing", False)
+
         n_ctx       = slot.get("n_ctx", 1)
         n_processed = slot.get("n_prompt_tokens_processed", 0)
         n_cache     = slot.get("n_prompt_tokens_cache", 0)
@@ -314,8 +317,9 @@ class MetricsCollector:
             self._last_reasoning_in_content = slot_data.reasoning_in_content
 
         # KV cache high-watermark (preserved when slot goes idle)
-        kv_tokens = n_cache + n_processed + n_decoded
-        if kv_tokens > 0:
+        # Only update when slot is actively processing to avoid capturing stale
+        # values when the slot transitions from Active to Idle state.
+        if is_processing and kv_tokens > 0:
             if slot_idx not in self._slot_kv_high or kv_tokens > self._slot_kv_high[slot_idx]:
                 self._slot_kv_high[slot_idx] = kv_tokens
 
