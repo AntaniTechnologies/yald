@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yald"
-version = "1.5.6"
+version = "1.6.0"
 description = "Yet Another Llama Dashboard - real-time terminal UI for llama-server"
 readme = "README.md"
 license = {text = "MIT"}

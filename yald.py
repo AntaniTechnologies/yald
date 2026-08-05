@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.5.6)
+YALD - Yet Another Llama Dashboard (v1.6.0)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -158,6 +158,9 @@ class MetricsCollector:
         self._last_slot_capacity: int = 0
         # Per-slot KV cache high-watermarks (preserved when slot goes idle)
         self._slot_kv_high: dict[int, int] = {}
+        # Per-slot KV cache last-seen values (when actively processing)
+        # Used to show the last active value when slot transitions to Idle
+        self._slot_kv_last: dict[int, int] = {}
 
         # Last-seen runtime values (not maximums) — used as safeguard when a
         # value drops to 0 mid-request (e.g. prompt consumed but slot not yet
@@ -322,6 +325,9 @@ class MetricsCollector:
         if is_processing and kv_tokens > 0:
             if slot_idx not in self._slot_kv_high or kv_tokens > self._slot_kv_high[slot_idx]:
                 self._slot_kv_high[slot_idx] = kv_tokens
+            # Also track the last-seen KV tokens while actively processing
+            # This is the value we want to show when the slot goes idle
+            self._slot_kv_last[slot_idx] = kv_tokens
 
         # Update last-seen values for the safeguard logic
         self._prev_context_tokens = n_prompt
@@ -704,6 +710,10 @@ class MetricsCollector:
         """Return the per-slot KV cache high-watermark dictionary."""
         return dict(self._slot_kv_high)
 
+    def get_slot_kv_last(self) -> dict[int, int]:
+        """Return the per-slot KV cache last-seen dictionary (when actively processing)."""
+        return dict(self._slot_kv_last)
+
 
 # ---------------------------------------------------------------------------
 # Layout builder
@@ -891,7 +901,9 @@ def make_performance_panel(snapshot: MetricSnapshot,
     return Panel(perf_table, title="[bold]Performance[/bold]", border_style="green", padding=(0, 0))
 
 
-def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int, int]] = None) -> Panel:
+def _build_slot_cell(slot: dict, slot_idx: int,
+                     slot_kv_high: Optional[dict[int, int]] = None,
+                     slot_kv_last: Optional[dict[int, int]] = None) -> Panel:
     """Build a single cell for one slot quadrant with state, progress bars, tokens.
 
     Fixed inner height of 11 lines, yielding exactly 13 character rows
@@ -948,12 +960,12 @@ def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int,
 
     # --- KV cache per slot (n_cache + n_processed + n_decoded) / n_ctx ------
     kv_tokens = n_cache + n_processed + n_decoded
-    # Preserve high-watermark when slot goes idle.
+    # Preserve last-seen value when slot goes idle.
     # Use the slot's actual is_processing state (from raw slot data), not the
     # computed idle/active display state, to determine when to use the cached
-    # high-watermark value.
-    if not is_processing and slot_kv_high and slot_idx in slot_kv_high:
-        kv_tokens = slot_kv_high[slot_idx]
+    # last-seen value.
+    if not is_processing and slot_kv_last and slot_idx in slot_kv_last:
+        kv_tokens = slot_kv_last[slot_idx]
     kv_ratio  = min(kv_tokens / n_ctx, 1.0) if n_ctx > 0 else 0.0
     kv_filled = int(kv_ratio * 20)
     kv_bar    = "█" * kv_filled + "░" * (20 - kv_filled)
@@ -999,7 +1011,8 @@ def _build_slot_cell(slot: dict, slot_idx: int, slot_kv_high: Optional[dict[int,
 
 
 def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int,
-                     slot_kv_high: Optional[dict[int, int]] = None) -> Panel:
+                     slot_kv_high: Optional[dict[int, int]] = None,
+                     slot_kv_last: Optional[dict[int, int]] = None) -> Panel:
     """Slots panel: 4 quadrants (Slot 0-3) with state, generation/prompt/KV progress bars.
 
     Each quadrant is a fixed 13-row panel (11 inner lines + top/bottom borders),
@@ -1018,7 +1031,7 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int,
     for slot_idx in range(0, 2):
         if slot_idx < len(raw_slots):
             slot = raw_slots[slot_idx]
-            top_cells[slot_idx - 0] = _build_slot_cell(slot, slot_idx, slot_kv_high)
+            top_cells[slot_idx - 0] = _build_slot_cell(slot, slot_idx, slot_kv_high, slot_kv_last)
         else:
             # Slot doesn't exist — skip this cell entirely (leave None)
             top_cells[slot_idx - 0] = None
@@ -1029,7 +1042,7 @@ def make_slots_panel(connected: bool, raw_slots: list[dict], term_height: int,
     for slot_idx in range(2, 4):
         if slot_idx < len(raw_slots):
             slot = raw_slots[slot_idx]
-            bottom_cells[slot_idx - 2] = _build_slot_cell(slot, slot_idx, slot_kv_high)
+            bottom_cells[slot_idx - 2] = _build_slot_cell(slot, slot_idx, slot_kv_high, slot_kv_last)
         else:
             # Slot doesn't exist — skip this cell entirely (leave None)
             bottom_cells[slot_idx - 2] = None
@@ -1131,7 +1144,8 @@ class YALDApplication:
             )
             self.layout["slots"].update(
                 make_slots_panel(connected, raw_slots, height,
-                                 self.collector.get_slot_kv_high())
+                                 self.collector.get_slot_kv_high(),
+                                 self.collector.get_slot_kv_last())
             )
         else:
             self.layout["body"].update(make_offline_panel(error or "Unknown error"))
