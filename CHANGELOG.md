@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Connection resilience:** `OFFLINE_THRESHOLD` (4 consecutive failures) replaces the previous 2-failure threshold, reducing false OFFLINE reports during transient timeouts or connection resets under load
+- **Model-loading detection:** HTTP 503 from llama-server (model loading) is now recognized as a reachable state — the header shows "● LOADING" instead of OFFLINE, and the last good snapshot continues to render
+- **Hardened HTTP session:** `_make_session()` creates a session with `limit_per_host=8`, `enable_cleanup_closed=True`, and `ttl_dns_cache=300` to reduce connection churn and handle stale keep-alive sockets
+- **Session recreation:** After 2 consecutive connection errors the session is rebuilt from scratch, discarding poisoned pooled sockets that would otherwise keep failing
+- **Generous timeouts:** Default timeout raised from 2 s to 6 s total (2 s connect, 4 s socket read) so healthy servers under heavy prefill are not mistakenly marked offline
+- **Slot-fetch retry:** `/slots` now retries once on transient failures (reset, truncated body), preventing a single hiccup from wasting the whole poll cycle
+- **JSON error resilience:** Malformed / truncated responses no longer flip the connection state — the last good snapshot is preserved and the next cycle retries
+- **`Collector.is_loading()`:** New accessor exposing the model-loading (HTTP 503) state
+
+### Changed
+
+- **Header:** Shows "● LOADING" (orange) with optional error detail when the server responds with HTTP 503; falls back to last-good snapshot instead of the offline panel during loading
+- **Header `make_header()`:** New `loading` parameter
+
+### Fixed
+
+- **Connection flapping under load:** Combined changes (higher offline threshold, session recreation, longer timeouts, slot retry) dramatically reduce false OFFLINE reports during server restarts, model loads, and heavy prefill workloads
+
 ## [1.6.0] - 2026-08-05
 
 ### Fixed

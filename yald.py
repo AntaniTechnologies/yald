@@ -1,5 +1,5 @@
 """
-YALD - Yet Another Llama Dashboard (v1.6.0)
+YALD - Yet Another Llama Dashboard (v1.7.0)
 
 A real-time terminal UI for monitoring llama-server instances.
 
@@ -126,6 +126,11 @@ class MetricsCollector:
     METRICS_ENDPOINT  = "/metrics"
     PROPS_ENDPOINT    = "/props"
 
+    # Consecutive failed poll cycles required before reporting OFFLINE.
+    # At a 500 ms poll interval this means ~2 s of genuine unreachability,
+    # which filters out transient timeouts / connection resets under load.
+    OFFLINE_THRESHOLD = 4
+
     def __init__(self, server_url: str = "http://127.0.0.1:8080",
                  poll_interval: float = 0.5):
         self.server_url    = server_url
@@ -143,6 +148,9 @@ class MetricsCollector:
         self._last_error: Optional[str] = None
         self._consecutive_failures: int = 0
         self._success_after_offline: int = 0
+        # True while llama-server responds with HTTP 503 (model loading).
+        # The server is reachable in this state — not offline.
+        self._server_loading = False
 
         self._state_log: list[tuple[float, str]] = []
         self._log_max   = 10
@@ -182,8 +190,34 @@ class MetricsCollector:
 
     async def start(self) -> None:
         self._running = True
-        self._session = aiohttp.ClientSession()
+        self._session = self._make_session()
         self._poll_task = asyncio.create_task(self._poll_loop())
+
+    @staticmethod
+    def _make_session() -> aiohttp.ClientSession:
+        """Create a session with a hardened connector.
+
+        * limit_per_host keeps connection churn bounded.
+        * enable_cleanup_closed proactively discards half-closed sockets,
+          which llama-server produces when it times out idle keep-alive
+          connections (a classic source of spurious resets).
+        """
+        connector = aiohttp.TCPConnector(
+            limit_per_host=8,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+        )
+        return aiohttp.ClientSession(connector=connector)
+
+    async def _recreate_session(self) -> None:
+        """Discard all pooled connections and start fresh.
+
+        Used after repeated connection failures — stale/poisoned keep-alive
+        sockets would otherwise keep failing even though the server is fine.
+        """
+        if self._session:
+            await self._session.close()
+        self._session = self._make_session()
 
     async def stop(self) -> None:
         self._running = False
@@ -206,7 +240,10 @@ class MetricsCollector:
         ignore_errors: bool = False,
     ) -> Optional[str]:
         """Fetch raw text from *endpoint*.  Raises on error unless *ignore_errors*."""
-        timeout = aiohttp.ClientTimeout(total=2.0)
+        # Generous timeouts: llama-server can legitimately take several
+        # seconds to answer while under heavy prefill/load.  A short total
+        # timeout made healthy servers look offline.
+        timeout = aiohttp.ClientTimeout(total=6.0, connect=2.0, sock_read=4.0)
         try:
             async with session.get(
                 f"{self.server_url}{endpoint}", timeout=timeout,
@@ -349,8 +386,24 @@ class MetricsCollector:
     # Collection loop
     # ------------------------------------------------------------------
 
+    def _register_failure(self, message: str) -> None:
+        """Count a failed poll cycle; flip OFFLINE only after a sustained outage."""
+        self._consecutive_failures += 1
+        self._last_error = message
+        if self._consecutive_failures >= self.OFFLINE_THRESHOLD:
+            self._connected = False
+
     async def _poll_loop(self) -> None:
-        """Async polling loop — runs until *stop()* cancels this task."""
+        """Async polling loop — runs until *stop()* cancels this task.
+
+        Error-handling policy:
+        * Transport errors (timeout / connection reset) count toward the
+          OFFLINE threshold (OFFLINE_THRESHOLD consecutive failures).
+        * HTTP 503 means "model loading" — the server is reachable, so this
+          never counts as offline.
+        * Data errors (bad JSON) keep the last good snapshot and never flip
+          connectivity — they are a parsing problem, not an outage.
+        """
         while self._running:
             try:
                 snapshot = await self._fetch_and_parse()
@@ -361,6 +414,7 @@ class MetricsCollector:
                 if len(self._history) > self._history_max:
                     self._history.pop(0)
                 self._consecutive_failures = 0
+                self._server_loading = False
                 if not self._connected:
                     self._success_after_offline += 1
                     if self._success_after_offline >= 2:
@@ -370,26 +424,36 @@ class MetricsCollector:
                 else:
                     self._last_error = None
 
-            except aiohttp.ClientConnectionError:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= 2:
-                    self._connected  = False
-                    self._last_error = "Connection refused"
             except asyncio.TimeoutError:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= 2:
-                    self._connected  = False
-                    self._last_error = "Request timeout"
+                # NOTE: caught before ClientConnectionError because
+                # aiohttp.ServerTimeoutError inherits from both.
+                self._register_failure("Request timeout")
+
             except aiohttp.ClientResponseError as e:
-                self._consecutive_failures += 1
+                if e.status == 503:
+                    # llama-server returns 503 while loading the model.
+                    # Reachable — show LOADING instead of OFFLINE.
+                    self._server_loading = True
+                    self._consecutive_failures = 0
+                    self._last_error = "Server loading (HTTP 503)"
+                else:
+                    self._register_failure(f"HTTP {e.status}")
+
+            except aiohttp.ClientConnectionError as e:
+                self._register_failure(f"Connection error ({type(e).__name__})")
+                # Repeated resets usually mean stale pooled sockets —
+                # rebuild the session so the next cycle starts clean.
                 if self._consecutive_failures >= 2:
-                    self._connected  = False
-                    self._last_error = f"HTTP {e.status}"
+                    await self._recreate_session()
+
+            except (json.JSONDecodeError, ValueError) as e:
+                # Malformed / truncated response body: not a connectivity
+                # problem.  Keep the last good snapshot and retry next cycle.
+                self._last_error = f"Bad response from server ({e})"
+                self._consecutive_failures = 0
+
             except Exception as e:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= 2:
-                    self._connected  = False
-                    self._last_error = str(e)
+                self._register_failure(f"{type(e).__name__}: {e}")
 
             await asyncio.sleep(self.poll_interval)
 
@@ -413,7 +477,7 @@ class MetricsCollector:
         # Fetch /slots (required) alongside /health, /metrics, /props (optional)
         health_ok, slots_resp, metrics_text, props_resp = await asyncio.gather(
             self._health_check(session),
-            self._fetch_slots(session),
+            self._fetch_slots_with_retry(session),
             self._fetch_metrics_text(session),
             self._fetch_props(session),
         )
@@ -513,6 +577,27 @@ class MetricsCollector:
         """Fetch /slots.  Raises on error — this is the primary endpoint."""
         text = await self._fetch_text(session, self.SLOTS_ENDPOINT)
         return json.loads(text)  # type: ignore[return-value]
+
+    async def _fetch_slots_with_retry(self, session: aiohttp.ClientSession) -> list[dict]:
+        """Fetch /slots with one in-cycle retry on transient failures.
+
+        A single hiccup (reset, truncated body) no longer wastes the whole
+        poll cycle or counts toward the OFFLINE threshold.  HTTP status
+        errors are *not* retried (deterministic, e.g. 503 loading), and
+        neither are timeouts — a timed-out request has already consumed the
+        full timeout budget, so an immediate retry would just double the
+        worst-case outage-detection latency.
+        """
+        try:
+            return await self._fetch_slots(session)
+        except (aiohttp.ClientResponseError, asyncio.TimeoutError):
+            raise
+        except Exception as e:
+            await asyncio.sleep(0.25)
+            try:
+                return await self._fetch_slots(session)
+            except Exception:
+                raise e
 
     async def _fetch_metrics_text(self, session: aiohttp.ClientSession) -> Optional[str]:
         """Fetch /metrics text.  Returns None if unavailable."""
@@ -696,6 +781,10 @@ class MetricsCollector:
     def is_connected(self) -> bool:
         return self._connected
 
+    def is_loading(self) -> bool:
+        """True while the server responds with HTTP 503 (model loading)."""
+        return self._server_loading
+
     def get_last_error(self) -> Optional[str]:
         return self._last_error
 
@@ -748,6 +837,7 @@ def make_header(
     connected: bool,
     server_url: str = "",
     error: Optional[str] = None,
+    loading: bool = False,
 ) -> Panel:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -755,7 +845,12 @@ def make_header(
     title.append("YALD", style="bold cyan")
     title.append(" Yet Another Llama Dashboard", style="dim white")
 
-    if connected:
+    if loading:
+        # HTTP 503 — server reachable, model still loading. Not offline.
+        status = Text("● LOADING", style="bold dark_orange")
+        if error:
+            status.append(f" ({error})", style="dim")
+    elif connected:
         status = Text("● ONLINE", style="bold green")
     else:
         status = Text("● OFFLINE / DISCONNECTED", style="bold red")
@@ -1125,6 +1220,7 @@ class YALDApplication:
 
     def _update_layout(self) -> None:
         connected = self.collector.is_connected()
+        loading   = self.collector.is_loading()
         error     = self.collector.get_last_error()
         snapshot  = self.collector.get_snapshot()
         raw_slots = self.collector.get_raw_slots()
@@ -1135,9 +1231,13 @@ class YALDApplication:
         if self._debug_fp is not None:
             self._log_debug(raw_slots, None)
 
-        self.layout["header"].update(make_header(connected, self.collector.server_url, error))
+        self.layout["header"].update(
+            make_header(connected, self.collector.server_url, error, loading)
+        )
 
-        if connected:
+        # During LOADING (HTTP 503) the server is reachable — keep rendering
+        # the last good snapshot instead of the offline panel.
+        if connected or loading:
             self.layout["metrics"].update(make_metrics_panel(snapshot, self._frame))
             self.layout["performance"].update(
                 make_performance_panel(snapshot, self.collector)
